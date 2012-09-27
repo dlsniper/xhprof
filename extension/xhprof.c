@@ -255,6 +255,9 @@ ZEND_DLEXPORT void (*_zend_execute_internal) (zend_execute_data *data,
 static zend_op_array * (*_zend_compile_file) (zend_file_handle *file_handle,
                                               int type TSRMLS_DC);
 
+/* Pointer to the original compile string function (used by eval) */
+static zend_op_array * (*_zend_compile_string) (zval *source_string, char *filename TSRMLS_DC);
+
 /* Bloom filter for function names to be ignored */
 #define INDEX_2_BYTE(index)  (index >> 3)
 #define INDEX_2_BIT(index)   (1 << (index & 0x7));
@@ -292,8 +295,29 @@ static inline zval  *hp_zval_at_key(char  *key,
 static inline char **hp_strings_in_zval(zval  *values);
 static inline void   hp_array_del(char **name_array);
 
-static int restore_cpu_affinity(cpu_set_t * prev_mask);
-static int bind_to_cpu(uint32 cpu_id);
+/* {{{ arginfo */
+ZEND_BEGIN_ARG_INFO_EX(arginfo_xhprof_enable, 0, 0, 0)
+  ZEND_ARG_INFO(0, flags)
+  ZEND_ARG_INFO(0, options)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_xhprof_disable, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_xhprof_sample_enable, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_xhprof_sample_disable, 0)
+ZEND_END_ARG_INFO()
+/* }}} */
+
+/**
+ * *********************
+ * FUNCTION PROTOTYPES
+ * *********************
+ */
+int restore_cpu_affinity(cpu_set_t * prev_mask);
+int bind_to_cpu(uint32 cpu_id);
 
 /**
  * *********************
@@ -302,10 +326,10 @@ static int bind_to_cpu(uint32 cpu_id);
  */
 /* List of functions implemented/exposed by xhprof */
 zend_function_entry xhprof_functions[] = {
-  PHP_FE(xhprof_enable, NULL)
-  PHP_FE(xhprof_disable, NULL)
-  PHP_FE(xhprof_sample_enable, NULL)
-  PHP_FE(xhprof_sample_disable, NULL)
+  PHP_FE(xhprof_enable, arginfo_xhprof_enable)
+  PHP_FE(xhprof_disable, arginfo_xhprof_disable)
+  PHP_FE(xhprof_sample_enable, arginfo_xhprof_sample_enable)
+  PHP_FE(xhprof_sample_disable, arginfo_xhprof_sample_disable)
   {NULL, NULL, NULL}
 };
 
@@ -769,7 +793,6 @@ void hp_clean_profiler_state(TSRMLS_D) {
 size_t hp_get_entry_name(hp_entry_t  *entry,
                          char           *result_buf,
                          size_t          result_len) {
-  size_t    len = 0;
 
   /* Validate result_len */
   if (result_len <= 1) {
@@ -1327,7 +1350,7 @@ static double get_cpu_frequency() {
     perror("gettimeofday");
     return 0.0;
   }
-  
+
   tsc_start = cycle_timer();
 
   /* Sleep for 5 miliseconds. Comparaing with gettimeofday's  few microseconds
@@ -1337,7 +1360,7 @@ static double get_cpu_frequency() {
     perror("gettimeofday");
     return 0.0;
   }
-  
+
   tsc_end = cycle_timer();
 
   return (tsc_end - tsc_start) * 1.0 / (get_us_interval(&start, &end));
@@ -1488,11 +1511,11 @@ void hp_mode_sampled_init_cb(TSRMLS_D) {
   double cpu_freq = hp_globals.cpu_frequencies[hp_globals.cur_cpu_id];
 
   if (cpu_freq == 0.0) {
-    /* There is an insignificant chance that cpu_freq equals 0 
+    /* There is an insignificant chance that cpu_freq equals 0
        and we cannot do anything in this case */
     return;
   }
-  
+
   /* Init the last_sample in tsc */
   hp_globals.last_sample_tsc = cycle_timer();
 
@@ -1758,6 +1781,29 @@ ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle,
   return ret;
 }
 
+/**
+ * Proxy for zend_compile_string(). Used to profile PHP eval compilation time.
+ */
+ZEND_DLEXPORT zend_op_array* hp_compile_string(zval *source_string, char *filename TSRMLS_DC) {
+
+    char          *func;
+    int            len;
+    zend_op_array *ret;
+    int            hp_profile_flag = 1;
+
+    len  = strlen("eval") + strlen(filename) + 3;
+    func = (char *)emalloc(len);
+    snprintf(func, len, "eval::%s", filename);
+
+    BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+    ret = _zend_compile_string(source_string, filename TSRMLS_CC);
+    if (hp_globals.entries) {
+        END_PROFILING(&hp_globals.entries, hp_profile_flag);
+    }
+
+    efree(func);
+    return ret;
+}
 
 /**
  * **************************
@@ -1780,6 +1826,10 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
     /* Replace zend_compile with our proxy */
     _zend_compile_file = zend_compile_file;
     zend_compile_file  = hp_compile_file;
+
+    /* Replace zend_compile_string with our proxy */
+    _zend_compile_string = zend_compile_string;
+    zend_compile_string = hp_compile_string;
 
     /* Replace zend_execute with our proxy */
     _zend_execute = zend_execute;
